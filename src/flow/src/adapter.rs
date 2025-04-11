@@ -37,7 +37,6 @@ use serde::{Deserialize, Serialize};
 use servers::grpc::GrpcOptions;
 use servers::heartbeat_options::HeartbeatOptions;
 use servers::http::HttpOptions;
-use servers::Mode;
 use session::context::QueryContext;
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::storage::{ConcreteDataType, RegionId};
@@ -63,7 +62,7 @@ pub(crate) mod refill;
 mod stat;
 #[cfg(test)]
 mod tests;
-mod util;
+pub(crate) mod util;
 mod worker;
 
 pub(crate) mod node_context;
@@ -76,7 +75,7 @@ use crate::FrontendInvoker;
 // `GREPTIME_TIMESTAMP` is not used to distinguish when table is created automatically by flow
 pub const AUTO_CREATED_PLACEHOLDER_TS_COL: &str = "__ts_placeholder";
 
-pub const UPDATE_AT_TS_COL: &str = "update_at";
+pub const AUTO_CREATED_UPDATE_AT_TS_COL: &str = "update_at";
 
 // TODO(discord9): refactor common types for flow to a separate module
 /// FlowId is a unique identifier for a flow task
@@ -102,7 +101,6 @@ impl Default for FlowConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FlownodeOptions {
-    pub mode: Mode,
     pub node_id: Option<u64>,
     pub flow: FlowConfig,
     pub grpc: GrpcOptions,
@@ -116,7 +114,6 @@ pub struct FlownodeOptions {
 impl Default for FlownodeOptions {
     fn default() -> Self {
         Self {
-            mode: servers::Mode::Standalone,
             node_id: None,
             flow: FlowConfig::default(),
             grpc: GrpcOptions::default().with_bind_addr("127.0.0.1:3004"),
@@ -511,7 +508,7 @@ impl FlowWorkerManager {
             })
             .unwrap_or_default();
         let update_at = ColumnSchema::new(
-            UPDATE_AT_TS_COL,
+            AUTO_CREATED_UPDATE_AT_TS_COL,
             ConcreteDataType::timestamp_millisecond_datatype(),
             true,
         );

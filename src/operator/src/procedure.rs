@@ -13,10 +13,14 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+use catalog::CatalogManagerRef;
 use common_error::ext::BoxedError;
 use common_function::handlers::ProcedureServiceHandler;
 use common_meta::ddl::{ExecutorContext, ProcedureExecutorRef};
-use common_meta::rpc::procedure::{MigrateRegionRequest, ProcedureStateResponse};
+use common_meta::rpc::procedure::{
+    AddRegionFollowerRequest, MigrateRegionRequest, ProcedureStateResponse,
+    RemoveRegionFollowerRequest,
+};
 use common_query::error as query_error;
 use common_query::error::Result as QueryResult;
 use snafu::ResultExt;
@@ -25,11 +29,18 @@ use snafu::ResultExt;
 #[derive(Clone)]
 pub struct ProcedureServiceOperator {
     procedure_executor: ProcedureExecutorRef,
+    catalog_manager: CatalogManagerRef,
 }
 
 impl ProcedureServiceOperator {
-    pub fn new(procedure_executor: ProcedureExecutorRef) -> Self {
-        Self { procedure_executor }
+    pub fn new(
+        procedure_executor: ProcedureExecutorRef,
+        catalog_manager: CatalogManagerRef,
+    ) -> Self {
+        Self {
+            procedure_executor,
+            catalog_manager,
+        }
     }
 }
 
@@ -52,5 +63,28 @@ impl ProcedureServiceHandler for ProcedureServiceOperator {
             .await
             .map_err(BoxedError::new)
             .context(query_error::ProcedureServiceSnafu)
+    }
+
+    async fn add_region_follower(&self, request: AddRegionFollowerRequest) -> QueryResult<()> {
+        self.procedure_executor
+            .add_region_follower(&ExecutorContext::default(), request)
+            .await
+            .map_err(BoxedError::new)
+            .context(query_error::ProcedureServiceSnafu)
+    }
+
+    async fn remove_region_follower(
+        &self,
+        request: RemoveRegionFollowerRequest,
+    ) -> QueryResult<()> {
+        self.procedure_executor
+            .remove_region_follower(&ExecutorContext::default(), request)
+            .await
+            .map_err(BoxedError::new)
+            .context(query_error::ProcedureServiceSnafu)
+    }
+
+    fn catalog_manager(&self) -> &CatalogManagerRef {
+        &self.catalog_manager
     }
 }

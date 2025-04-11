@@ -29,11 +29,12 @@ use store_api::logstore::provider::{KafkaProvider, Provider};
 use store_api::logstore::{AppendBatchResponse, LogStore, SendableEntryStream, WalIndex};
 use store_api::storage::RegionId;
 
-use super::index::build_region_wal_index_iterator;
 use crate::error::{self, ConsumeRecordSnafu, Error, GetOffsetSnafu, InvalidProviderSnafu, Result};
 use crate::kafka::client_manager::{ClientManager, ClientManagerRef};
 use crate::kafka::consumer::{ConsumerBuilder, RecordsBuffer};
-use crate::kafka::index::{GlobalIndexCollector, MIN_BATCH_WINDOW_SIZE};
+use crate::kafka::index::{
+    build_region_wal_index_iterator, GlobalIndexCollector, MIN_BATCH_WINDOW_SIZE,
+};
 use crate::kafka::producer::OrderedBatchProducerRef;
 use crate::kafka::util::record::{
     convert_to_kafka_records, maybe_emit_entry, remaining_entries, Record, ESTIMATED_META_SIZE,
@@ -535,7 +536,7 @@ mod tests {
             .flatten()
             .cloned()
             .collect::<Vec<_>>();
-        all_entries.shuffle(&mut rand::thread_rng());
+        all_entries.shuffle(&mut rand::rng());
 
         let response = logstore.append_batch(all_entries.clone()).await.unwrap();
         // 5 region
@@ -575,7 +576,7 @@ mod tests {
             warn!("The endpoints is empty, skipping the test 'test_append_batch_basic_large'");
             return;
         };
-        let data_size_kb = rand::thread_rng().gen_range(9..31usize);
+        let data_size_kb = rand::rng().random_range(9..31usize);
         info!("Entry size: {}Ki", data_size_kb);
         let broker_endpoints = broker_endpoints
             .split(',')
@@ -608,7 +609,7 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         assert_matches!(all_entries[0], Entry::MultiplePart(_));
-        all_entries.shuffle(&mut rand::thread_rng());
+        all_entries.shuffle(&mut rand::rng());
 
         let response = logstore.append_batch(all_entries.clone()).await.unwrap();
         // 5 region

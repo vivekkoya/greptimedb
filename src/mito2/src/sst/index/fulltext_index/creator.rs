@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use common_telemetry::warn;
-use datatypes::schema::FulltextAnalyzer;
+use datatypes::schema::{FulltextAnalyzer, FulltextBackend};
 use index::fulltext_index::create::{
     BloomFilterFulltextIndexCreator, FulltextIndexCreator, TantivyFulltextIndexCreator,
 };
@@ -33,7 +35,9 @@ use crate::error::{
 use crate::read::Batch;
 use crate::sst::file::FileId;
 use crate::sst::index::fulltext_index::{INDEX_BLOB_TYPE_BLOOM, INDEX_BLOB_TYPE_TANTIVY};
-use crate::sst::index::intermediate::IntermediateManager;
+use crate::sst::index::intermediate::{
+    IntermediateLocation, IntermediateManager, TempFileProvider,
+};
 use crate::sst::index::puffin_manager::SstPuffinWriter;
 use crate::sst::index::statistics::{ByteCount, RowCount, Statistics};
 use crate::sst::index::TYPE_FULLTEXT_INDEX;
@@ -56,6 +60,7 @@ impl FulltextIndexer {
         intermediate_manager: &IntermediateManager,
         metadata: &RegionMetadataRef,
         compress: bool,
+        bloom_row_granularity: usize,
         mem_limit: usize,
     ) -> Result<Option<Self>> {
         let mut creators = HashMap::new();
@@ -86,11 +91,29 @@ impl FulltextIndexer {
                 case_sensitive: options.case_sensitive,
             };
 
-            // TODO(zhongzc): according to fulltext options, choose in the Tantivy flavor or Bloom Filter flavor.
-            let creator = TantivyFulltextIndexCreator::new(&intm_path, config, mem_limit)
-                .await
-                .context(CreateFulltextCreatorSnafu)?;
-            let inner = AltFulltextCreator::Tantivy(creator);
+            let inner = match options.backend {
+                FulltextBackend::Tantivy => {
+                    let creator = TantivyFulltextIndexCreator::new(&intm_path, config, mem_limit)
+                        .await
+                        .context(CreateFulltextCreatorSnafu)?;
+                    AltFulltextCreator::Tantivy(creator)
+                }
+                FulltextBackend::Bloom => {
+                    let temp_file_provider = Arc::new(TempFileProvider::new(
+                        IntermediateLocation::new(&metadata.region_id, sst_file_id),
+                        intermediate_manager.clone(),
+                    ));
+                    let global_memory_usage = Arc::new(AtomicUsize::new(0));
+                    let creator = BloomFilterFulltextIndexCreator::new(
+                        config,
+                        bloom_row_granularity,
+                        temp_file_provider,
+                        global_memory_usage,
+                        Some(mem_limit),
+                    );
+                    AltFulltextCreator::Bloom(creator)
+                }
+            };
 
             creators.insert(
                 column_id,
@@ -353,6 +376,9 @@ mod tests {
     use crate::access_layer::RegionFilePathFactory;
     use crate::read::{Batch, BatchColumn};
     use crate::sst::file::FileId;
+    use crate::sst::index::fulltext_index::applier::builder::{
+        FulltextQuery, FulltextRequest, FulltextTerm,
+    };
     use crate::sst::index::fulltext_index::applier::FulltextIndexApplier;
     use crate::sst::index::puffin_manager::PuffinManagerFactory;
 
@@ -377,6 +403,7 @@ mod tests {
                     enable: true,
                     analyzer: FulltextAnalyzer::English,
                     case_sensitive: true,
+                    backend: FulltextBackend::Tantivy,
                 })
                 .unwrap(),
                 semantic_type: SemanticType::Field,
@@ -392,6 +419,7 @@ mod tests {
                     enable: true,
                     analyzer: FulltextAnalyzer::English,
                     case_sensitive: false,
+                    backend: FulltextBackend::Tantivy,
                 })
                 .unwrap(),
                 semantic_type: SemanticType::Field,
@@ -407,6 +435,7 @@ mod tests {
                     enable: true,
                     analyzer: FulltextAnalyzer::Chinese,
                     case_sensitive: false,
+                    backend: FulltextBackend::Tantivy,
                 })
                 .unwrap(),
                 semantic_type: SemanticType::Field,
@@ -483,14 +512,25 @@ mod tests {
         .unwrap()
     }
 
-    async fn build_applier_factory(
+    /// Applier factory that can handle both queries and terms.
+    ///
+    /// It builds a fulltext index with the given data rows, and returns a function
+    /// that can handle both queries and terms in a single request.
+    ///
+    /// The function takes two parameters:
+    /// - `queries`: A list of (ColumnId, query_string) pairs for fulltext queries
+    /// - `terms`: A list of (ColumnId, [(bool, String)]) for fulltext terms, where bool indicates if term is lowercased
+    async fn build_fulltext_applier_factory(
         prefix: &str,
         rows: &[(
             Option<&str>, // text_english_case_sensitive
             Option<&str>, // text_english_case_insensitive
             Option<&str>, // text_chinese
         )],
-    ) -> impl Fn(Vec<(ColumnId, &str)>) -> BoxFuture<'static, BTreeSet<RowId>> {
+    ) -> impl Fn(
+        Vec<(ColumnId, &str)>,
+        Vec<(ColumnId, Vec<(bool, &str)>)>,
+    ) -> BoxFuture<'static, Option<BTreeSet<RowId>>> {
         let (d, factory) = PuffinManagerFactory::new_for_test_async(prefix).await;
         let region_dir = "region0".to_string();
         let sst_file_id = FileId::random();
@@ -504,6 +544,7 @@ mod tests {
             &intm_mgr,
             &region_metadata,
             true,
+            8096,
             1024,
         )
         .await
@@ -521,66 +562,253 @@ mod tests {
         let _ = indexer.finish(&mut writer).await.unwrap();
         writer.finish().await.unwrap();
 
-        move |queries| {
+        move |queries: Vec<(ColumnId, &str)>, terms_requests: Vec<(ColumnId, Vec<(bool, &str)>)>| {
             let _d = &d;
-            let applier = FulltextIndexApplier::new(
-                region_dir.clone(),
-                region_metadata.region_id,
-                object_store.clone(),
-                queries
+            let region_dir = region_dir.clone();
+            let object_store = object_store.clone();
+            let factory = factory.clone();
+
+            let mut requests: HashMap<ColumnId, FulltextRequest> = HashMap::new();
+
+            // Add queries
+            for (column_id, query) in queries {
+                requests
+                    .entry(column_id)
+                    .or_default()
+                    .queries
+                    .push(FulltextQuery(query.to_string()));
+            }
+
+            // Add terms
+            for (column_id, terms) in terms_requests {
+                let fulltext_terms = terms
                     .into_iter()
-                    .map(|(a, b)| (a, b.to_string()))
-                    .collect(),
-                factory.clone(),
+                    .map(|(col_lowered, term)| FulltextTerm {
+                        col_lowered,
+                        term: term.to_string(),
+                    })
+                    .collect::<Vec<_>>();
+
+                requests
+                    .entry(column_id)
+                    .or_default()
+                    .terms
+                    .extend(fulltext_terms);
+            }
+
+            let applier = FulltextIndexApplier::new(
+                region_dir,
+                region_metadata.region_id,
+                object_store,
+                requests,
+                factory,
             );
 
             async move { applier.apply(sst_file_id, None).await.unwrap() }.boxed()
         }
     }
 
+    fn rows(row_ids: impl IntoIterator<Item = RowId>) -> BTreeSet<RowId> {
+        row_ids.into_iter().collect()
+    }
+
     #[tokio::test]
-    async fn test_fulltext_index_basic() {
-        let applier_factory = build_applier_factory(
-            "test_fulltext_index_basic_",
+    async fn test_fulltext_index_basic_case_sensitive() {
+        let applier_factory = build_fulltext_applier_factory(
+            "test_fulltext_index_basic_case_sensitive_",
             &[
-                (Some("hello"), None, Some("你好")),
-                (Some("world"), Some("world"), None),
-                (None, Some("World"), Some("世界")),
-                (
-                    Some("Hello, World"),
-                    Some("Hello, World"),
-                    Some("你好，世界"),
-                ),
+                (Some("hello"), None, None),
+                (Some("world"), None, None),
+                (None, None, None),
+                (Some("Hello, World"), None, None),
             ],
         )
         .await;
 
-        let row_ids = applier_factory(vec![(1, "hello")]).await;
-        assert_eq!(row_ids, vec![0].into_iter().collect());
+        let row_ids = applier_factory(vec![(1, "hello")], vec![]).await;
+        assert_eq!(row_ids, Some(rows([0])));
 
-        let row_ids = applier_factory(vec![(1, "world")]).await;
-        assert_eq!(row_ids, vec![1].into_iter().collect());
+        let row_ids = applier_factory(vec![(1, "world")], vec![]).await;
+        assert_eq!(row_ids, Some(rows([1])));
 
-        let row_ids = applier_factory(vec![(2, "hello")]).await;
-        assert_eq!(row_ids, vec![3].into_iter().collect());
+        let row_ids = applier_factory(vec![(1, "Hello")], vec![]).await;
+        assert_eq!(row_ids, Some(rows([3])));
 
-        let row_ids = applier_factory(vec![(2, "world")]).await;
-        assert_eq!(row_ids, vec![1, 2, 3].into_iter().collect());
+        let row_ids = applier_factory(vec![(1, "World")], vec![]).await;
+        assert_eq!(row_ids, Some(rows([3])));
 
-        let row_ids = applier_factory(vec![(3, "你好")]).await;
-        assert_eq!(row_ids, vec![0, 3].into_iter().collect());
+        let row_ids = applier_factory(vec![], vec![(1, vec![(false, "hello")])]).await;
+        assert_eq!(row_ids, Some(rows([0])));
 
-        let row_ids = applier_factory(vec![(3, "世界")]).await;
-        assert_eq!(row_ids, vec![2, 3].into_iter().collect());
+        let row_ids = applier_factory(vec![], vec![(1, vec![(true, "hello")])]).await;
+        assert_eq!(row_ids, None);
+
+        let row_ids = applier_factory(vec![], vec![(1, vec![(false, "world")])]).await;
+        assert_eq!(row_ids, Some(rows([1])));
+
+        let row_ids = applier_factory(vec![], vec![(1, vec![(true, "world")])]).await;
+        assert_eq!(row_ids, None);
+
+        let row_ids = applier_factory(vec![], vec![(1, vec![(false, "Hello")])]).await;
+        assert_eq!(row_ids, Some(rows([3])));
+
+        let row_ids = applier_factory(vec![], vec![(1, vec![(true, "Hello")])]).await;
+        assert_eq!(row_ids, None);
+
+        let row_ids = applier_factory(vec![], vec![(1, vec![(false, "Hello, World")])]).await;
+        assert_eq!(row_ids, Some(rows([3])));
+
+        let row_ids = applier_factory(vec![], vec![(1, vec![(true, "Hello, World")])]).await;
+        assert_eq!(row_ids, None);
+    }
+
+    #[tokio::test]
+    async fn test_fulltext_index_basic_case_insensitive() {
+        let applier_factory = build_fulltext_applier_factory(
+            "test_fulltext_index_basic_case_insensitive_",
+            &[
+                (None, Some("hello"), None),
+                (None, None, None),
+                (None, Some("world"), None),
+                (None, Some("Hello, World"), None),
+            ],
+        )
+        .await;
+
+        let row_ids = applier_factory(vec![(2, "hello")], vec![]).await;
+        assert_eq!(row_ids, Some(rows([0, 3])));
+
+        let row_ids = applier_factory(vec![(2, "world")], vec![]).await;
+        assert_eq!(row_ids, Some(rows([2, 3])));
+
+        let row_ids = applier_factory(vec![(2, "Hello")], vec![]).await;
+        assert_eq!(row_ids, Some(rows([0, 3])));
+
+        let row_ids = applier_factory(vec![(2, "World")], vec![]).await;
+        assert_eq!(row_ids, Some(rows([2, 3])));
+
+        let row_ids = applier_factory(vec![], vec![(2, vec![(false, "hello")])]).await;
+        assert_eq!(row_ids, Some(rows([0, 3])));
+
+        let row_ids = applier_factory(vec![], vec![(2, vec![(true, "hello")])]).await;
+        assert_eq!(row_ids, Some(rows([0, 3])));
+
+        let row_ids = applier_factory(vec![], vec![(2, vec![(false, "world")])]).await;
+        assert_eq!(row_ids, Some(rows([2, 3])));
+
+        let row_ids = applier_factory(vec![], vec![(2, vec![(true, "world")])]).await;
+        assert_eq!(row_ids, Some(rows([2, 3])));
+
+        let row_ids = applier_factory(vec![], vec![(2, vec![(false, "Hello")])]).await;
+        assert_eq!(row_ids, Some(rows([0, 3])));
+
+        let row_ids = applier_factory(vec![], vec![(2, vec![(true, "Hello")])]).await;
+        assert_eq!(row_ids, Some(rows([0, 3])));
+
+        let row_ids = applier_factory(vec![], vec![(2, vec![(false, "World")])]).await;
+        assert_eq!(row_ids, Some(rows([2, 3])));
+
+        let row_ids = applier_factory(vec![], vec![(2, vec![(true, "World")])]).await;
+        assert_eq!(row_ids, Some(rows([2, 3])));
+    }
+
+    #[tokio::test]
+    async fn test_fulltext_index_basic_chinese() {
+        let applier_factory = build_fulltext_applier_factory(
+            "test_fulltext_index_basic_chinese_",
+            &[
+                (None, None, Some("你好")),
+                (None, None, None),
+                (None, None, Some("世界")),
+                (None, None, Some("你好，世界")),
+            ],
+        )
+        .await;
+
+        let row_ids = applier_factory(vec![(3, "你好")], vec![]).await;
+        assert_eq!(row_ids, Some(rows([0, 3])));
+
+        let row_ids = applier_factory(vec![(3, "世界")], vec![]).await;
+        assert_eq!(row_ids, Some(rows([2, 3])));
+
+        let row_ids = applier_factory(vec![], vec![(3, vec![(false, "你好")])]).await;
+        assert_eq!(row_ids, Some(rows([0, 3])));
+
+        let row_ids = applier_factory(vec![], vec![(3, vec![(false, "世界")])]).await;
+        assert_eq!(row_ids, Some(rows([2, 3])));
+    }
+
+    #[tokio::test]
+    async fn test_fulltext_index_multi_terms_case_sensitive() {
+        let applier_factory = build_fulltext_applier_factory(
+            "test_fulltext_index_multi_terms_case_sensitive_",
+            &[
+                (Some("Hello"), None, None),
+                (Some("World"), None, None),
+                (None, None, None),
+                (Some("Hello, World"), None, None),
+            ],
+        )
+        .await;
+
+        let row_ids =
+            applier_factory(vec![], vec![(1, vec![(false, "hello"), (false, "world")])]).await;
+        assert_eq!(row_ids, Some(rows([])));
+
+        let row_ids =
+            applier_factory(vec![], vec![(1, vec![(false, "Hello"), (false, "World")])]).await;
+        assert_eq!(row_ids, Some(rows([3])));
+
+        let row_ids =
+            applier_factory(vec![], vec![(1, vec![(true, "Hello"), (false, "World")])]).await;
+        assert_eq!(row_ids, Some(rows([1, 3])));
+
+        let row_ids =
+            applier_factory(vec![], vec![(1, vec![(false, "Hello"), (true, "World")])]).await;
+        assert_eq!(row_ids, Some(rows([0, 3])));
+
+        let row_ids =
+            applier_factory(vec![], vec![(1, vec![(true, "Hello"), (true, "World")])]).await;
+        assert_eq!(row_ids, None);
+    }
+
+    #[tokio::test]
+    async fn test_fulltext_index_multi_terms_case_insensitive() {
+        let applier_factory = build_fulltext_applier_factory(
+            "test_fulltext_index_multi_terms_case_insensitive_",
+            &[
+                (None, Some("hello"), None),
+                (None, None, None),
+                (None, Some("world"), None),
+                (None, Some("Hello, World"), None),
+            ],
+        )
+        .await;
+
+        let row_ids =
+            applier_factory(vec![], vec![(2, vec![(false, "hello"), (false, "world")])]).await;
+        assert_eq!(row_ids, Some(rows([3])));
+
+        let row_ids =
+            applier_factory(vec![], vec![(2, vec![(true, "hello"), (false, "world")])]).await;
+        assert_eq!(row_ids, Some(rows([3])));
+
+        let row_ids =
+            applier_factory(vec![], vec![(2, vec![(false, "hello"), (true, "world")])]).await;
+        assert_eq!(row_ids, Some(rows([3])));
+
+        let row_ids =
+            applier_factory(vec![], vec![(2, vec![(true, "hello"), (true, "world")])]).await;
+        assert_eq!(row_ids, Some(rows([3])));
     }
 
     #[tokio::test]
     async fn test_fulltext_index_multi_columns() {
-        let applier_factory = build_applier_factory(
+        let applier_factory = build_fulltext_applier_factory(
             "test_fulltext_index_multi_columns_",
             &[
-                (Some("hello"), None, Some("你好")),
-                (Some("world"), Some("world"), None),
+                (Some("Hello"), None, Some("你好")),
+                (Some("World"), Some("world"), None),
                 (None, Some("World"), Some("世界")),
                 (
                     Some("Hello, World"),
@@ -591,13 +819,14 @@ mod tests {
         )
         .await;
 
-        let row_ids = applier_factory(vec![(1, "hello"), (3, "你好")]).await;
-        assert_eq!(row_ids, vec![0].into_iter().collect());
+        let row_ids = applier_factory(
+            vec![(1, "Hello"), (3, "你好")],
+            vec![(2, vec![(false, "world")])],
+        )
+        .await;
+        assert_eq!(row_ids, Some(rows([3])));
 
-        let row_ids = applier_factory(vec![(1, "world"), (3, "世界")]).await;
-        assert_eq!(row_ids, vec![].into_iter().collect());
-
-        let row_ids = applier_factory(vec![(2, "world"), (3, "世界")]).await;
-        assert_eq!(row_ids, vec![2, 3].into_iter().collect());
+        let row_ids = applier_factory(vec![(2, "World")], vec![(1, vec![(false, "World")])]).await;
+        assert_eq!(row_ids, Some(rows([1, 3])));
     }
 }

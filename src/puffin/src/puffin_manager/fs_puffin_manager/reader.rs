@@ -24,7 +24,6 @@ use futures::io::BufReader;
 use futures::{AsyncRead, AsyncWrite};
 use snafu::{ensure, OptionExt, ResultExt};
 
-use super::PuffinMetadataCacheRef;
 use crate::blob_metadata::{BlobMetadata, CompressionCodec};
 use crate::error::{
     BlobIndexOutOfBoundSnafu, BlobNotFoundSnafu, DeserializeJsonSnafu, FileKeyNotMatchSnafu,
@@ -35,8 +34,9 @@ use crate::file_metadata::FileMetadata;
 use crate::partial_reader::PartialReader;
 use crate::puffin_manager::file_accessor::PuffinFileAccessor;
 use crate::puffin_manager::fs_puffin_manager::dir_meta::DirMetadata;
+use crate::puffin_manager::fs_puffin_manager::PuffinMetadataCacheRef;
 use crate::puffin_manager::stager::{BoxWriter, DirWriterProviderRef, Stager};
-use crate::puffin_manager::{BlobGuard, PuffinReader};
+use crate::puffin_manager::{BlobGuard, GuardWithMetadata, PuffinReader};
 
 /// `FsPuffinReader` is a `PuffinReader` that provides fs readers for puffin files.
 pub struct FsPuffinReader<S, F>
@@ -96,35 +96,23 @@ where
     }
 
     async fn metadata(&self) -> Result<Arc<FileMetadata>> {
-        let reader = self.puffin_file_accessor.reader(&self.handle).await?;
-        let mut file = PuffinFileReader::new(reader);
+        let mut file = self.puffin_reader().await?;
         self.get_puffin_file_metadata(&mut file).await
     }
 
-    async fn blob(&self, key: &str) -> Result<Self::Blob> {
-        let mut reader = self.puffin_file_accessor.reader(&self.handle).await?;
-        if let Some(file_size_hint) = self.file_size_hint {
-            reader.with_file_size_hint(file_size_hint);
-        }
-        let mut file = PuffinFileReader::new(reader);
-
-        let metadata = self.get_puffin_file_metadata(&mut file).await?;
-        let blob_metadata = metadata
-            .blobs
-            .iter()
-            .find(|m| m.blob_type == key)
-            .context(BlobNotFoundSnafu { blob: key })?
-            .clone();
-
+    async fn blob(&self, key: &str) -> Result<GuardWithMetadata<Self::Blob>> {
+        let mut file = self.puffin_reader().await?;
+        let blob_metadata = self.get_blob_metadata(key, &mut file).await?;
         let blob = if blob_metadata.compression_codec.is_none() {
             // If the blob is not compressed, we can directly read it from the puffin file.
             Either::L(RandomReadBlob {
                 handle: self.handle.clone(),
                 accessor: self.puffin_file_accessor.clone(),
-                blob_metadata,
+                blob_metadata: blob_metadata.clone(),
             })
         } else {
             // If the blob is compressed, we need to decompress it into staging space before reading.
+            let blob_metadata = blob_metadata.clone();
             let staged_blob = self
                 .stager
                 .get_blob(
@@ -139,28 +127,33 @@ where
             Either::R(staged_blob)
         };
 
-        Ok(blob)
+        Ok(GuardWithMetadata::new(blob, blob_metadata))
     }
 
-    async fn dir(&self, key: &str) -> Result<Self::Dir> {
-        self.stager
+    async fn dir(&self, key: &str) -> Result<GuardWithMetadata<Self::Dir>> {
+        let mut file = self.puffin_reader().await?;
+        let blob_metadata = self.get_blob_metadata(key, &mut file).await?;
+        let dir = self
+            .stager
             .get_dir(
                 &self.handle,
                 key,
                 Box::new(|writer_provider| {
                     let accessor = self.puffin_file_accessor.clone();
                     let handle = self.handle.clone();
-                    let key = key.to_string();
+                    let blob_metadata = blob_metadata.clone();
                     Box::pin(Self::init_dir_to_stager(
+                        file,
+                        blob_metadata,
                         handle,
-                        key,
                         writer_provider,
                         accessor,
-                        self.file_size_hint,
                     ))
                 }),
             )
-            .await
+            .await?;
+
+        Ok(GuardWithMetadata::new(dir, blob_metadata))
     }
 }
 
@@ -187,6 +180,30 @@ where
         Ok(metadata)
     }
 
+    async fn get_blob_metadata(
+        &self,
+        key: &str,
+        file: &mut PuffinFileReader<F::Reader>,
+    ) -> Result<BlobMetadata> {
+        let metadata = self.get_puffin_file_metadata(file).await?;
+        let blob_metadata = metadata
+            .blobs
+            .iter()
+            .find(|m| m.blob_type == key)
+            .context(BlobNotFoundSnafu { blob: key })?
+            .clone();
+
+        Ok(blob_metadata)
+    }
+
+    async fn puffin_reader(&self) -> Result<PuffinFileReader<F::Reader>> {
+        let mut reader = self.puffin_file_accessor.reader(&self.handle).await?;
+        if let Some(file_size_hint) = self.file_size_hint {
+            reader.with_file_size_hint(file_size_hint);
+        }
+        Ok(PuffinFileReader::new(reader))
+    }
+
     async fn init_blob_to_stager(
         reader: PuffinFileReader<F::Reader>,
         blob_metadata: BlobMetadata,
@@ -200,26 +217,14 @@ where
     }
 
     async fn init_dir_to_stager(
+        mut file: PuffinFileReader<F::Reader>,
+        blob_metadata: BlobMetadata,
         handle: F::FileHandle,
-        key: String,
         writer_provider: DirWriterProviderRef,
         accessor: F,
-        file_size_hint: Option<u64>,
     ) -> Result<u64> {
-        let mut reader = accessor.reader(&handle).await?;
-        if let Some(file_size_hint) = file_size_hint {
-            reader.with_file_size_hint(file_size_hint);
-        }
-        let mut file = PuffinFileReader::new(reader);
-
         let puffin_metadata = file.metadata().await?;
-        let blob_metadata = puffin_metadata
-            .blobs
-            .iter()
-            .find(|m| m.blob_type == key.as_str())
-            .context(BlobNotFoundSnafu { blob: key })?;
-
-        let reader = file.blob_reader(blob_metadata)?;
+        let reader = file.blob_reader(&blob_metadata)?;
         let meta = reader.metadata().await.context(MetadataSnafu)?;
         let buf = reader
             .read(0..meta.content_length)

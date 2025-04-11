@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use catalog::information_schema::{
-    columns, flows, key_column_usage, schemata, tables, CHARACTER_SETS, COLLATIONS, COLUMNS, FLOWS,
-    KEY_COLUMN_USAGE, SCHEMATA, TABLES, VIEWS,
+    columns, flows, key_column_usage, region_peers, schemata, tables, CHARACTER_SETS, COLLATIONS,
+    COLUMNS, FLOWS, KEY_COLUMN_USAGE, REGION_PEERS, SCHEMATA, TABLES, VIEWS,
 };
 use catalog::CatalogManagerRef;
 use common_catalog::consts::{
@@ -57,8 +57,8 @@ use sql::ast::Ident;
 use sql::parser::ParserContext;
 use sql::statements::create::{CreateDatabase, CreateFlow, CreateView, Partitions};
 use sql::statements::show::{
-    ShowColumns, ShowDatabases, ShowFlows, ShowIndex, ShowKind, ShowTableStatus, ShowTables,
-    ShowVariables, ShowViews,
+    ShowColumns, ShowDatabases, ShowFlows, ShowIndex, ShowKind, ShowRegion, ShowTableStatus,
+    ShowTables, ShowVariables, ShowViews,
 };
 use sql::statements::statement::Statement;
 use sql::statements::OptionMap;
@@ -301,8 +301,7 @@ async fn query_from_information_schema_table(
                     .state()
                     .clone(),
             )
-            .read_table(view)
-            .context(error::DataFusionSnafu)?;
+            .read_table(view)?;
 
             let planner = query_engine.planner();
             let planner = planner
@@ -319,10 +318,7 @@ async fn query_from_information_schema_table(
         }
     };
 
-    let stream = dataframe
-        .execute_stream()
-        .await
-        .context(error::DataFusionSnafu)?;
+    let stream = dataframe.execute_stream().await?;
 
     Ok(Output::new_with_stream(Box::pin(
         RecordBatchStreamAdapter::try_new(stream).context(error::CreateRecordBatchSnafu)?,
@@ -453,7 +449,7 @@ pub async fn show_index(
         null().alias(INDEX_EXPRESSION_COLUMN),
         Expr::Wildcard {
             qualifier: None,
-            options: WildcardOptions::default(),
+            options: Box::new(WildcardOptions::default()),
         },
     ];
 
@@ -492,6 +488,52 @@ pub async fn show_index(
         query_ctx,
         KEY_COLUMN_USAGE,
         select,
+        projects,
+        filters,
+        like_field,
+        sort,
+        stmt.kind,
+    )
+    .await
+}
+
+/// Execute `SHOW REGION` statement.
+pub async fn show_region(
+    stmt: ShowRegion,
+    query_engine: &QueryEngineRef,
+    catalog_manager: &CatalogManagerRef,
+    query_ctx: QueryContextRef,
+) -> Result<Output> {
+    let schema_name = if let Some(database) = stmt.database {
+        database
+    } else {
+        query_ctx.current_schema()
+    };
+
+    let filters = vec![
+        col(region_peers::TABLE_NAME).eq(lit(&stmt.table)),
+        col(region_peers::TABLE_SCHEMA).eq(lit(schema_name.clone())),
+        col(region_peers::TABLE_CATALOG).eq(lit(query_ctx.current_catalog())),
+    ];
+    let projects = vec![
+        (region_peers::TABLE_NAME, "Table"),
+        (region_peers::REGION_ID, "Region"),
+        (region_peers::PEER_ID, "Peer"),
+        (region_peers::IS_LEADER, "Leader"),
+    ];
+
+    let like_field = None;
+    let sort = vec![
+        col(columns::REGION_ID).sort(true, true),
+        col(columns::PEER_ID).sort(true, true),
+    ];
+
+    query_from_information_schema_table(
+        query_engine,
+        catalog_manager,
+        query_ctx,
+        REGION_PEERS,
+        vec![],
         projects,
         filters,
         like_field,
@@ -678,6 +720,7 @@ pub fn show_variable(stmt: ShowVariables, query_ctx: QueryContextRef) -> Result<
     let value = match variable.as_str() {
         "SYSTEM_TIME_ZONE" | "SYSTEM_TIMEZONE" => get_timezone(None).to_string(),
         "TIME_ZONE" | "TIMEZONE" => query_ctx.timezone().to_string(),
+        "READ_PREFERENCE" => query_ctx.read_preference().to_string(),
         "DATESTYLE" => {
             let (style, order) = *query_ctx.configuration_parameter().pg_datetime_style();
             format!("{}, {}", style, order)
@@ -746,10 +789,7 @@ pub async fn show_search_path(_query_ctx: QueryContextRef) -> Result<Output> {
 
 pub fn show_create_database(database_name: &str, options: OptionMap) -> Result<Output> {
     let stmt = CreateDatabase {
-        name: ObjectName(vec![Ident {
-            value: database_name.to_string(),
-            quote_style: None,
-        }]),
+        name: ObjectName(vec![Ident::new(database_name)]),
         if_not_exists: true,
         options,
     };
@@ -952,10 +992,7 @@ pub fn show_create_flow(
 
     let stmt = CreateFlow {
         flow_name,
-        sink_table_name: ObjectName(vec![Ident {
-            value: flow_val.sink_table_name().table_name.clone(),
-            quote_style: None,
-        }]),
+        sink_table_name: ObjectName(vec![Ident::new(&flow_val.sink_table_name().table_name)]),
         // notice we don't want `OR REPLACE` and `IF NOT EXISTS` in same sql since it's unclear what to do
         // so we set `or_replace` to false.
         or_replace: false,

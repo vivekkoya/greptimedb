@@ -19,6 +19,8 @@ use std::str::FromStr;
 use api::prom_store::remote::WriteRequest;
 use auth::user_provider_from_option;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
+use chrono::Utc;
+use common_catalog::consts::{trace_services_table_name, TRACE_TABLE_NAME};
 use common_error::status_code::StatusCode as ErrorCode;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -34,6 +36,7 @@ use serde_json::{json, Value};
 use servers::http::handler::HealthResponse;
 use servers::http::header::constants::GREPTIME_LOG_TABLE_NAME_HEADER_NAME;
 use servers::http::header::{GREPTIME_DB_HEADER_NAME, GREPTIME_TIMEZONE_HEADER_NAME};
+use servers::http::jaeger::JAEGER_TIME_RANGE_FOR_OPERATIONS_HEADER;
 use servers::http::prometheus::{PrometheusJsonResponse, PrometheusResponse};
 use servers::http::result::error_result::ErrorResponse;
 use servers::http::result::greptime_result_v1::GreptimedbV1Response;
@@ -96,6 +99,7 @@ macro_rules! http_tests {
                 test_identify_pipeline_with_flatten,
                 test_identify_pipeline_with_custom_ts,
                 test_pipeline_dispatcher,
+                test_pipeline_suffix_template,
 
                 test_otlp_metrics,
                 test_otlp_traces_v0,
@@ -434,7 +438,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         res.text().await,
-        "[{\"DescribeTable\":{\"name\":[{\"value\":\"t\",\"quote_style\":null}]}}]"
+        r#"[{"DescribeTable":{"name":[{"value":"t","quote_style":null,"span":{"start":{"line":0,"column":0},"end":{"line":0,"column":0}}}]}}]"#,
     );
 
     // test timezone header
@@ -672,6 +676,19 @@ pub async fn test_prom_http_api(store_type: StorageType) {
     // single match[]
     let res = client
         .get("/v1/prometheus/api/v1/label/host/values?match[]=demo&start=0&end=300")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
+    assert_eq!(body.status, "success");
+    assert_eq!(
+        body.data,
+        serde_json::from_value::<PrometheusResponse>(json!(["host1"])).unwrap()
+    );
+
+    // single match[] with __name__
+    let res = client
+        .get("/v1/prometheus/api/v1/label/host/values?match[]={__name__%3D%22demo%22}&start=0&end=300")
         .send()
         .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -937,7 +954,6 @@ providers = []"#,
 
     let expected_toml_str = format!(
         r#"
-mode = "standalone"
 enable_telemetry = true
 init_regions_in_background = false
 init_regions_parallelism = 16
@@ -1020,6 +1036,7 @@ purge_interval = "1m"
 [procedure]
 max_retry_times = 3
 retry_delay = "500ms"
+max_running_procedures = 128
 
 [flow]
 
@@ -1644,6 +1661,137 @@ transform:
     guard.remove_all().await;
 }
 
+pub async fn test_pipeline_suffix_template(storage_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (app, mut guard) =
+        setup_test_http_app_with_frontend(storage_type, "test_pipeline_suffix_template").await;
+
+    // handshake
+    let client = TestClient::new(app).await;
+
+    let root_pipeline = r#"
+processors:
+  - date:
+      field: time
+      formats:
+        - "%Y-%m-%d %H:%M:%S%.3f"
+      ignore_missing: true
+
+transform:
+  - fields:
+      - id1, id1_root
+      - id2, id2_root
+    type: int32
+  - fields:
+      - type
+      - log
+      - logger
+    type: string
+  - field: time
+    type: time
+    index: timestamp
+table_suffix: _${type}
+"#;
+
+    // 1. create pipeline
+    let res = client
+        .post("/v1/events/pipelines/root")
+        .header("Content-Type", "application/x-yaml")
+        .body(root_pipeline)
+        .send()
+        .await;
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 2. write data
+    let data_body = r#"
+[
+  {
+    "id1": "2436",
+    "id2": "2528",
+    "logger": "INTERACT.MANAGER",
+    "type": "http",
+    "time": "2024-05-25 20:16:37.217",
+    "log": "ClusterAdapter:enter sendTextDataToCluster\\n"
+  },
+  {
+    "id1": "2436",
+    "id2": "2528",
+    "logger": "INTERACT.MANAGER",
+    "type": "http",
+    "time": "2024-05-25 20:16:37.217",
+    "log": "ClusterAdapter:enter sendTextDataToCluster\\n"
+  },
+  {
+    "id1": "2436",
+    "id2": "2528",
+    "logger": "INTERACT.MANAGER",
+    "type": "db",
+    "time": "2024-05-25 20:16:37.217",
+    "log": "ClusterAdapter:enter sendTextDataToCluster\\n"
+  },
+  {
+    "id1": "2436",
+    "id2": "2528",
+    "logger": "INTERACT.MANAGER",
+    "type": "http",
+    "time": "2024-05-25 20:16:37.217",
+    "log": "ClusterAdapter:enter sendTextDataToCluster\\n"
+  },
+  {
+    "id1": "2436",
+    "id2": "2528",
+    "logger": "INTERACT.MANAGER",
+    "time": "2024-05-25 20:16:37.217",
+    "log": "ClusterAdapter:enter sendTextDataToCluster\\n"
+  }
+]
+"#;
+    let res = client
+        .post("/v1/events/logs?db=public&table=d_table&pipeline_name=root")
+        .header("Content-Type", "application/json")
+        .body(data_body)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 3. check table list
+    validate_data(
+        "test_pipeline_suffix_template_table_list",
+        &client,
+        "show tables",
+        "[[\"d_table\"],[\"d_table_db\"],[\"d_table_http\"],[\"demo\"],[\"numbers\"]]",
+    )
+    .await;
+
+    // 4. check each table's data
+    validate_data(
+        "test_pipeline_suffix_template_default",
+        &client,
+        "select * from d_table",
+        "[[2436,2528,null,\"ClusterAdapter:enter sendTextDataToCluster\\\\n\",\"INTERACT.MANAGER\",1716668197217000000]]",
+    )
+    .await;
+
+    validate_data(
+        "test_pipeline_name_template_db",
+        &client,
+        "select * from d_table_db",
+        "[[2436,2528,\"db\",\"ClusterAdapter:enter sendTextDataToCluster\\\\n\",\"INTERACT.MANAGER\",1716668197217000000]]",
+    )
+    .await;
+
+    validate_data(
+        "test_pipeline_name_template_http",
+        &client,
+        "select * from d_table_http",
+        "[[2436,2528,\"http\",\"ClusterAdapter:enter sendTextDataToCluster\\\\n\",\"INTERACT.MANAGER\",1716668197217000000],[2436,2528,\"http\",\"ClusterAdapter:enter sendTextDataToCluster\\\\n\",\"INTERACT.MANAGER\",1716668197217000000],[2436,2528,\"http\",\"ClusterAdapter:enter sendTextDataToCluster\\\\n\",\"INTERACT.MANAGER\",1716668197217000000]]",
+    )
+    .await;
+
+    guard.remove_all().await;
+}
+
 pub async fn test_identify_pipeline_with_flatten(store_type: StorageType) {
     common_telemetry::init_default_ut_logging();
     let (app, mut guard) =
@@ -2192,16 +2340,34 @@ pub async fn test_otlp_traces_v0(store_type: StorageType) {
     // write traces data
     let res = send_req(
         &client,
-        vec![(
-            HeaderName::from_static("content-type"),
-            HeaderValue::from_static("application/x-protobuf"),
-        )],
+        vec![
+            (
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/x-protobuf"),
+            ),
+            (
+                HeaderName::from_static("x-greptime-pipeline-name"),
+                HeaderValue::from_static("greptime_trace_v0"),
+            ),
+        ],
         "/v1/otlp/v1/traces",
         body.clone(),
         false,
     )
     .await;
     assert_eq!(StatusCode::OK, res.status());
+
+    let expected = r#"[["telemetrygen"]]"#;
+    validate_data(
+        "otlp_traces",
+        &client,
+        &format!(
+            "select service_name from {};",
+            trace_services_table_name(TRACE_TABLE_NAME)
+        ),
+        expected,
+    )
+    .await;
 
     // select traces data
     let expected = r#"[[1736480942444376000,1736480942444499000,123000,"telemetrygen","c05d7a4ec8e1f231f02ed6e8da8655b4","d24f921c75f68e23","","SPAN_KIND_CLIENT","lets-go","STATUS_CODE_UNSET","","",{"net.peer.ip":"1.2.3.4","peer.service":"telemetrygen-server"},[],[],"telemetrygen","",{},{"service.name":"telemetrygen"}],[1736480942444376000,1736480942444499000,123000,"telemetrygen","c05d7a4ec8e1f231f02ed6e8da8655b4","9630f2916e2f7909","d24f921c75f68e23","SPAN_KIND_SERVER","okey-dokey-0","STATUS_CODE_UNSET","","",{"net.peer.ip":"1.2.3.4","peer.service":"telemetrygen-client"},[],[],"telemetrygen","",{},{"service.name":"telemetrygen"}],[1736480942444589000,1736480942444712000,123000,"telemetrygen","cc9e0991a2e63d274984bd44ee669203","eba7be77e3558179","","SPAN_KIND_CLIENT","lets-go","STATUS_CODE_UNSET","","",{"net.peer.ip":"1.2.3.4","peer.service":"telemetrygen-server"},[],[],"telemetrygen","",{},{"service.name":"telemetrygen"}],[1736480942444589000,1736480942444712000,123000,"telemetrygen","cc9e0991a2e63d274984bd44ee669203","8f847259b0f6e1ab","eba7be77e3558179","SPAN_KIND_SERVER","okey-dokey-0","STATUS_CODE_UNSET","","",{"net.peer.ip":"1.2.3.4","peer.service":"telemetrygen-client"},[],[],"telemetrygen","",{},{"service.name":"telemetrygen"}]]"#;
@@ -2223,6 +2389,26 @@ pub async fn test_otlp_traces_v0(store_type: StorageType) {
     // write traces data with gzip
     let res = send_req(
         &client,
+        vec![
+            (
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/x-protobuf"),
+            ),
+            (
+                HeaderName::from_static("x-greptime-pipeline-name"),
+                HeaderValue::from_static("greptime_trace_v0"),
+            ),
+        ],
+        "/v1/otlp/v1/traces",
+        body.clone(),
+        true,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, res.status());
+
+    // write traces data without pipeline
+    let res = send_req(
+        &client,
         vec![(
             HeaderName::from_static("content-type"),
             HeaderValue::from_static("application/x-protobuf"),
@@ -2232,7 +2418,7 @@ pub async fn test_otlp_traces_v0(store_type: StorageType) {
         true,
     )
     .await;
-    assert_eq!(StatusCode::OK, res.status());
+    assert_eq!(StatusCode::BAD_REQUEST, res.status());
 
     // select traces data again
     validate_data(
@@ -2255,6 +2441,7 @@ pub async fn test_otlp_traces_v1(store_type: StorageType) {
 {"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"telemetrygen"}}],"droppedAttributesCount":0},"scopeSpans":[{"scope":{"name":"telemetrygen","version":"","attributes":[],"droppedAttributesCount":0},"spans":[{"traceId":"c05d7a4ec8e1f231f02ed6e8da8655b4","spanId":"9630f2916e2f7909","traceState":"","parentSpanId":"d24f921c75f68e23","flags":256,"name":"okey-dokey-0","kind":2,"startTimeUnixNano":"1736480942444376000","endTimeUnixNano":"1736480942444499000","attributes":[{"key":"net.peer.ip","value":{"stringValue":"1.2.3.4"}},{"key":"peer.service","value":{"stringValue":"telemetrygen-client"}}],"droppedAttributesCount":0,"events":[],"droppedEventsCount":0,"links":[],"droppedLinksCount":0,"status":{"message":"","code":0}},{"traceId":"c05d7a4ec8e1f231f02ed6e8da8655b4","spanId":"d24f921c75f68e23","traceState":"","parentSpanId":"","flags":256,"name":"lets-go","kind":3,"startTimeUnixNano":"1736480942444376000","endTimeUnixNano":"1736480942444499000","attributes":[{"key":"net.peer.ip","value":{"stringValue":"1.2.3.4"}},{"key":"peer.service","value":{"stringValue":"telemetrygen-server"}}],"droppedAttributesCount":0,"events":[],"droppedEventsCount":0,"links":[],"droppedLinksCount":0,"status":{"message":"","code":0}},{"traceId":"cc9e0991a2e63d274984bd44ee669203","spanId":"8f847259b0f6e1ab","traceState":"","parentSpanId":"eba7be77e3558179","flags":256,"name":"okey-dokey-0","kind":2,"startTimeUnixNano":"1736480942444589000","endTimeUnixNano":"1736480942444712000","attributes":[{"key":"net.peer.ip","value":{"stringValue":"1.2.3.4"}},{"key":"peer.service","value":{"stringValue":"telemetrygen-client"}}],"droppedAttributesCount":0,"events":[],"droppedEventsCount":0,"links":[],"droppedLinksCount":0,"status":{"message":"","code":0}},{"traceId":"cc9e0991a2e63d274984bd44ee669203","spanId":"eba7be77e3558179","traceState":"","parentSpanId":"","flags":256,"name":"lets-go","kind":3,"startTimeUnixNano":"1736480942444589000","endTimeUnixNano":"1736480942444712000","attributes":[{"key":"net.peer.ip","value":{"stringValue":"1.2.3.4"}},{"key":"peer.service","value":{"stringValue":"telemetrygen-server"}}],"droppedAttributesCount":0,"events":[],"droppedEventsCount":0,"links":[],"droppedLinksCount":0,"status":{"message":"","code":0}}],"schemaUrl":""}],"schemaUrl":"https://opentelemetry.io/schemas/1.4.0"}]}
 "#;
 
+    let trace_table_name = "mytable";
     let req: ExportTraceServiceRequest = serde_json::from_str(content).unwrap();
     let body = req.encode_to_vec();
 
@@ -2275,7 +2462,7 @@ pub async fn test_otlp_traces_v1(store_type: StorageType) {
             ),
             (
                 HeaderName::from_static("x-greptime-trace-table-name"),
-                HeaderValue::from_static("mytable"),
+                HeaderValue::from_static(trace_table_name),
             ),
         ],
         "/v1/otlp/v1/traces",
@@ -2284,6 +2471,18 @@ pub async fn test_otlp_traces_v1(store_type: StorageType) {
     )
     .await;
     assert_eq!(StatusCode::OK, res.status());
+
+    let expected = r#"[["telemetrygen"]]"#;
+    validate_data(
+        "otlp_traces",
+        &client,
+        &format!(
+            "select service_name from {};",
+            trace_services_table_name(trace_table_name)
+        ),
+        expected,
+    )
+    .await;
 
     // select traces data
     let expected = r#"[[1736480942444376000,1736480942444499000,123000,null,"c05d7a4ec8e1f231f02ed6e8da8655b4","d24f921c75f68e23","SPAN_KIND_CLIENT","lets-go","STATUS_CODE_UNSET","","","telemetrygen","","telemetrygen","1.2.3.4","telemetrygen-server",[],[]],[1736480942444376000,1736480942444499000,123000,"d24f921c75f68e23","c05d7a4ec8e1f231f02ed6e8da8655b4","9630f2916e2f7909","SPAN_KIND_SERVER","okey-dokey-0","STATUS_CODE_UNSET","","","telemetrygen","","telemetrygen","1.2.3.4","telemetrygen-client",[],[]],[1736480942444589000,1736480942444712000,123000,null,"cc9e0991a2e63d274984bd44ee669203","eba7be77e3558179","SPAN_KIND_CLIENT","lets-go","STATUS_CODE_UNSET","","","telemetrygen","","telemetrygen","1.2.3.4","telemetrygen-server",[],[]],[1736480942444589000,1736480942444712000,123000,"eba7be77e3558179","cc9e0991a2e63d274984bd44ee669203","8f847259b0f6e1ab","SPAN_KIND_SERVER","okey-dokey-0","STATUS_CODE_UNSET","","","telemetrygen","","telemetrygen","1.2.3.4","telemetrygen-client",[],[]]]"#;
@@ -2294,6 +2493,18 @@ pub async fn test_otlp_traces_v1(store_type: StorageType) {
         "otlp_traces",
         &client,
         "show create table mytable;",
+        expected_ddl,
+    )
+    .await;
+
+    let expected_ddl = r#"[["mytable_services","CREATE TABLE IF NOT EXISTS \"mytable_services\" (\n  \"timestamp\" TIMESTAMP(9) NOT NULL,\n  \"service_name\" STRING NULL,\n  TIME INDEX (\"timestamp\")\n)\n\nENGINE=mito\nWITH(\n  append_mode = 'true'\n)"]]"#;
+    validate_data(
+        "otlp_traces",
+        &client,
+        &format!(
+            "show create table {};",
+            trace_services_table_name(trace_table_name)
+        ),
         expected_ddl,
     )
     .await;
@@ -2316,7 +2527,7 @@ pub async fn test_otlp_traces_v1(store_type: StorageType) {
             ),
             (
                 HeaderName::from_static("x-greptime-trace-table-name"),
-                HeaderValue::from_static("mytable"),
+                HeaderValue::from_static(trace_table_name),
             ),
         ],
         "/v1/otlp/v1/traces",
@@ -2900,10 +3111,16 @@ pub async fn test_jaeger_query_api(store_type: StorageType) {
     // write traces data.
     let res = send_req(
         &client,
-        vec![(
-            HeaderName::from_static("content-type"),
-            HeaderValue::from_static("application/x-protobuf"),
-        )],
+        vec![
+            (
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/x-protobuf"),
+            ),
+            (
+                HeaderName::from_static("x-greptime-pipeline-name"),
+                HeaderValue::from_static("greptime_trace_v0"),
+            ),
+        ],
         "/v1/otlp/v1/traces",
         body.clone(),
         false,
@@ -2931,7 +3148,7 @@ pub async fn test_jaeger_query_api(store_type: StorageType) {
 
     // Test `/api/operations` API.
     let res = client
-        .get("/v1/jaeger/api/operations?service=test-jaeger-query-api")
+        .get("/v1/jaeger/api/operations?service=test-jaeger-query-api&start=1738726754492421&end=1738726754642422")
         .send()
         .await;
     assert_eq!(StatusCode::OK, res.status());
@@ -2959,7 +3176,7 @@ pub async fn test_jaeger_query_api(store_type: StorageType) {
 
     // Test `/api/services/{service_name}/operations` API.
     let res = client
-        .get("/v1/jaeger/api/services/test-jaeger-query-api/operations")
+        .get("/v1/jaeger/api/services/test-jaeger-query-api/operations?start=1738726754492421&end=1738726754642422")
         .send()
         .await;
     assert_eq!(StatusCode::OK, res.status());
@@ -2993,10 +3210,10 @@ pub async fn test_jaeger_query_api(store_type: StorageType) {
       "spans": [
         {
           "traceID": "5611dce1bc9ebed65352d99a027b08ea",
-          "spanID": "008421dbbd33a3e9",
-          "operationName": "access-mysql",
+          "spanID": "ffa03416a7b9ea48",
+          "operationName": "access-redis",
           "references": [],
-          "startTime": 1738726754492421,
+          "startTime": 1738726754492422,
           "duration": 100000,
           "tags": [
             {
@@ -3007,7 +3224,7 @@ pub async fn test_jaeger_query_api(store_type: StorageType) {
             {
               "key": "operation.type",
               "type": "string",
-              "value": "access-mysql"
+              "value": "access-redis"
             },
             {
               "key": "otel.scope.name",
@@ -3035,10 +3252,10 @@ pub async fn test_jaeger_query_api(store_type: StorageType) {
         },
         {
           "traceID": "5611dce1bc9ebed65352d99a027b08ea",
-          "spanID": "ffa03416a7b9ea48",
-          "operationName": "access-redis",
+          "spanID": "008421dbbd33a3e9",
+          "operationName": "access-mysql",
           "references": [],
-          "startTime": 1738726754492422,
+          "startTime": 1738726754492421,
           "duration": 100000,
           "tags": [
             {
@@ -3049,7 +3266,7 @@ pub async fn test_jaeger_query_api(store_type: StorageType) {
             {
               "key": "operation.type",
               "type": "string",
-              "value": "access-redis"
+              "value": "access-mysql"
             },
             {
               "key": "otel.scope.name",
@@ -3182,11 +3399,7 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
     let client = TestClient::new(app).await;
 
     // Test empty response for `/api/services` API before writing any traces.
-    let res = client
-        .get("/v1/jaeger/api/services")
-        .header("x-greptime-trace-table-name", "mytable")
-        .send()
-        .await;
+    let res = client.get("/v1/jaeger/api/services").send().await;
     assert_eq!(StatusCode::OK, res.status());
     let expected = r#"
     {
@@ -3295,6 +3508,34 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
                                 }
                             }
                         ]
+                    },
+                    {
+                        "scope": {
+                        "name": "test-jaeger-get-operations",
+                        "version": "1.0.0"
+                        },
+                        "spans": [
+                            {
+                                "traceId": "5611dce1bc9ebed65352d99a027b08ff",
+                                "spanId": "ffa03416a7b9ea48",
+                                "name": "access-pg",
+                                "kind": 2,
+                                "startTimeUnixNano": "1738726754492422000",
+                                "endTimeUnixNano": "1738726754592422000",
+                                "attributes": [
+                                    {
+                                        "key": "operation.type",
+                                        "value": {
+                                        "stringValue": "access-pg"
+                                        }
+                                    }
+                                ],
+                                "status": {
+                                    "message": "success",
+                                    "code": 0
+                                }
+                            }
+                        ]
                     }
                 ],
                 "schemaUrl": "https://opentelemetry.io/schemas/1.4.0"
@@ -3303,8 +3544,23 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
     }
     "#;
 
-    let req: ExportTraceServiceRequest = serde_json::from_str(content).unwrap();
+    let mut req: ExportTraceServiceRequest = serde_json::from_str(content).unwrap();
+    // Modify timestamp fields
+    let now = Utc::now().timestamp_nanos_opt().unwrap() as u64;
+    for span in req.resource_spans.iter_mut() {
+        for scope_span in span.scope_spans.iter_mut() {
+            // Only modify the timestamp fields for the span with the name "test-jaeger-get-operations" to current time.
+            if scope_span.scope.as_ref().unwrap().name == "test-jaeger-get-operations" {
+                for span in scope_span.spans.iter_mut() {
+                    span.start_time_unix_nano = now - 5_000_000_000; // 5 seconds ago
+                    span.end_time_unix_nano = now;
+                }
+            }
+        }
+    }
     let body = req.encode_to_vec();
+
+    let trace_table_name = "mytable";
     // write traces data.
     let res = send_req(
         &client,
@@ -3319,7 +3575,7 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
             ),
             (
                 HeaderName::from_static("x-greptime-trace-table-name"),
-                HeaderValue::from_static("mytable"),
+                HeaderValue::from_static(trace_table_name),
             ),
         ],
         "/v1/otlp/v1/traces",
@@ -3332,7 +3588,7 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
     // Test `/api/services` API.
     let res = client
         .get("/v1/jaeger/api/services")
-        .header("x-greptime-trace-table-name", "mytable")
+        .header("x-greptime-trace-table-name", trace_table_name)
         .send()
         .await;
     assert_eq!(StatusCode::OK, res.status());
@@ -3354,7 +3610,8 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
     // Test `/api/operations` API.
     let res = client
         .get("/v1/jaeger/api/operations?service=test-jaeger-query-api")
-        .header("x-greptime-trace-table-name", "mytable")
+        .header("x-greptime-trace-table-name", trace_table_name)
+        .header(JAEGER_TIME_RANGE_FOR_OPERATIONS_HEADER, "3 days")
         .send()
         .await;
     assert_eq!(StatusCode::OK, res.status());
@@ -3362,15 +3619,11 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
     {
         "data": [
             {
-                "name": "access-mysql",
-                "spanKind": "server"
-            },
-            {
-                "name": "access-redis",
+                "name": "access-pg",
                 "spanKind": "server"
             }
         ],
-        "total": 2,
+        "total": 1,
         "limit": 0,
         "offset": 0,
         "errors": []
@@ -3382,8 +3635,8 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
 
     // Test `/api/services/{service_name}/operations` API.
     let res = client
-        .get("/v1/jaeger/api/services/test-jaeger-query-api/operations")
-        .header("x-greptime-trace-table-name", "mytable")
+        .get("/v1/jaeger/api/services/test-jaeger-query-api/operations?start=1738726754492421&end=1738726754642422")
+        .header("x-greptime-trace-table-name", trace_table_name)
         .send()
         .await;
     assert_eq!(StatusCode::OK, res.status());
@@ -3406,7 +3659,7 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
     // Test `/api/traces/{trace_id}` API.
     let res = client
         .get("/v1/jaeger/api/traces/5611dce1bc9ebed65352d99a027b08ea")
-        .header("x-greptime-trace-table-name", "mytable")
+        .header("x-greptime-trace-table-name", trace_table_name)
         .send()
         .await;
     assert_eq!(StatusCode::OK, res.status());
@@ -3417,10 +3670,10 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
       "spans": [
         {
           "traceID": "5611dce1bc9ebed65352d99a027b08ea",
-          "spanID": "008421dbbd33a3e9",
-          "operationName": "access-mysql",
+          "spanID": "ffa03416a7b9ea48",
+          "operationName": "access-redis",
           "references": [],
-          "startTime": 1738726754492421,
+          "startTime": 1738726754492422,
           "duration": 100000,
           "tags": [
             {
@@ -3431,7 +3684,7 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
             {
               "key": "operation.type",
               "type": "string",
-              "value": "access-mysql"
+              "value": "access-redis"
             },
             {
               "key": "otel.scope.name",
@@ -3459,10 +3712,10 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
         },
         {
           "traceID": "5611dce1bc9ebed65352d99a027b08ea",
-          "spanID": "ffa03416a7b9ea48",
-          "operationName": "access-redis",
+          "spanID": "008421dbbd33a3e9",
+          "operationName": "access-mysql",
           "references": [],
-          "startTime": 1738726754492422,
+          "startTime": 1738726754492421,
           "duration": 100000,
           "tags": [
             {
@@ -3473,7 +3726,7 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
             {
               "key": "operation.type",
               "type": "string",
-              "value": "access-redis"
+              "value": "access-mysql"
             },
             {
               "key": "otel.scope.name",
@@ -3522,7 +3775,7 @@ pub async fn test_jaeger_query_api_for_trace_v1(store_type: StorageType) {
     // Test `/api/traces` API.
     let res = client
         .get("/v1/jaeger/api/traces?service=test-jaeger-query-api&operation=access-mysql&start=1738726754492421&end=1738726754642422&tags=%7B%22operation.type%22%3A%22access-mysql%22%7D")
-        .header("x-greptime-trace-table-name", "mytable")
+        .header("x-greptime-trace-table-name", trace_table_name)
         .send()
         .await;
     assert_eq!(StatusCode::OK, res.status());

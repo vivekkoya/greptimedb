@@ -22,8 +22,8 @@ use crate::error::{
 use crate::parser::ParserContext;
 use crate::statements::show::{
     ShowColumns, ShowCreateDatabase, ShowCreateFlow, ShowCreateTable, ShowCreateTableVariant,
-    ShowCreateView, ShowDatabases, ShowFlows, ShowIndex, ShowKind, ShowSearchPath, ShowStatus,
-    ShowTableStatus, ShowTables, ShowVariables, ShowViews,
+    ShowCreateView, ShowDatabases, ShowFlows, ShowIndex, ShowKind, ShowRegion, ShowSearchPath,
+    ShowStatus, ShowTableStatus, ShowTables, ShowVariables, ShowViews,
 };
 use crate::statements::statement::Statement;
 
@@ -74,6 +74,9 @@ impl ParserContext<'_> {
         {
             // SHOW {INDEX | INDEXES | KEYS}
             self.parse_show_index()
+        } else if self.consume_token("REGIONS") || self.consume_token("REGION") {
+            // SHOW REGIONS
+            self.parse_show_regions()
         } else if self.consume_token("CREATE") {
             if self.consume_token("DATABASE") || self.consume_token("SCHEMA") {
                 self.parse_show_create_database()
@@ -292,7 +295,7 @@ impl ParserContext<'_> {
                 Keyword::LIKE => {
                     self.parser.next_token();
                     Ok(ShowKind::Like(
-                        Self::parse_identifier(&mut self.parser).with_context(|_| {
+                        self.parser.parse_identifier().with_context(|_| {
                             error::UnexpectedSnafu {
                                 expected: "LIKE",
                                 actual: self.peek_token_as_string(),
@@ -373,6 +376,64 @@ impl ParserContext<'_> {
         }))
     }
 
+    fn parse_show_regions(&mut self) -> Result<Statement> {
+        let table = match self.parser.peek_token().token {
+            // SHOW REGION {in | FROM} TABLE
+            Token::Word(w) if matches!(w.keyword, Keyword::IN | Keyword::FROM) => {
+                self.parse_show_table_name()?
+            }
+            _ => {
+                return error::UnexpectedTokenSnafu {
+                    expected: "{FROM | IN} table",
+                    actual: self.peek_token_as_string(),
+                }
+                .fail();
+            }
+        };
+
+        let database = match self.parser.peek_token().token {
+            Token::EOF | Token::SemiColon => {
+                return Ok(Statement::ShowRegion(ShowRegion {
+                    kind: ShowKind::All,
+                    table,
+                    database: None,
+                }));
+            }
+
+            // SHOW REGION {In | FROM} TABLE {In | FROM} DATABASE
+            Token::Word(w) => match w.keyword {
+                Keyword::IN | Keyword::FROM => self.parse_db_name()?,
+
+                _ => None,
+            },
+            _ => None,
+        };
+
+        let kind = match self.parser.peek_token().token {
+            Token::EOF | Token::SemiColon => ShowKind::All,
+            // SHOW REGION [WHERE] [EXPR]
+            Token::Word(w) => match w.keyword {
+                Keyword::WHERE => {
+                    self.parser.next_token();
+                    ShowKind::Where(self.parser.parse_expr().with_context(|_| {
+                        error::UnexpectedSnafu {
+                            expected: "some valid expression",
+                            actual: self.peek_token_as_string(),
+                        }
+                    })?)
+                }
+                _ => return self.unsupported(self.peek_token_as_string()),
+            },
+            _ => return self.unsupported(self.peek_token_as_string()),
+        };
+
+        Ok(Statement::ShowRegion(ShowRegion {
+            kind,
+            database,
+            table,
+        }))
+    }
+
     fn parse_show_tables(&mut self, full: bool) -> Result<Statement> {
         let database = match self.parser.peek_token().token {
             Token::EOF | Token::SemiColon => {
@@ -437,12 +498,12 @@ impl ParserContext<'_> {
             ))),
             Token::Word(w) => match w.keyword {
                 Keyword::LIKE => Ok(Statement::ShowDatabases(ShowDatabases::new(
-                    ShowKind::Like(Self::parse_identifier(&mut self.parser).with_context(
-                        |_| error::UnexpectedSnafu {
+                    ShowKind::Like(self.parser.parse_identifier().with_context(|_| {
+                        error::UnexpectedSnafu {
                             expected: "LIKE",
                             actual: tok.to_string(),
-                        },
-                    )?),
+                        }
+                    })?),
                     full,
                 ))),
                 Keyword::WHERE => Ok(Statement::ShowDatabases(ShowDatabases::new(
@@ -578,6 +639,7 @@ mod tests {
                 kind: ShowKind::Like(sqlparser::ast::Ident {
                     value: _,
                     quote_style: None,
+                    span: _,
                 }),
                 ..
             })
@@ -637,6 +699,7 @@ mod tests {
                 kind: ShowKind::Like(sqlparser::ast::Ident {
                     value: _,
                     quote_style: None,
+                    span: _,
                 }),
                 database: None,
                 full: false
@@ -655,6 +718,7 @@ mod tests {
                 kind: ShowKind::Like(sqlparser::ast::Ident {
                     value: _,
                     quote_style: None,
+                    span: _,
                 }),
                 database: Some(_),
                 full: false
@@ -745,6 +809,7 @@ mod tests {
                 kind: ShowKind::Like(sqlparser::ast::Ident {
                     value: _,
                     quote_style: None,
+                    span: _,
                 }),
                 database: None,
                 full: true
@@ -763,6 +828,7 @@ mod tests {
                 kind: ShowKind::Like(sqlparser::ast::Ident {
                     value: _,
                     quote_style: None,
+                    span: _,
                 }),
                 database: Some(_),
                 full: true
@@ -895,6 +961,62 @@ mod tests {
         assert_eq!(1, stmts.len());
         assert!(matches!(&stmts[0],
                          Statement::ShowIndex(ShowIndex {
+                             table,
+                             kind: ShowKind::Where(expr),
+                             ..
+                         }) if table == "test" && expr.to_string() == "Field = 'disk'"));
+    }
+
+    #[test]
+    fn test_show_region() {
+        let sql = "SHOW REGION";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let error = result.unwrap_err();
+        assert_eq!("Unexpected token while parsing SQL statement, expected: '{FROM | IN} table', found: EOF", error.to_string());
+
+        let sql = "SHOW REGION from test";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let stmts = result.unwrap();
+        assert_eq!(1, stmts.len());
+        assert!(matches!(&stmts[0],
+                         Statement::ShowRegion(ShowRegion {
+                             table,
+                             database,
+                             ..
+
+                         }) if table == "test" && database.is_none()));
+
+        let sql = "SHOW REGION from test from public";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let stmts = result.unwrap();
+        assert_eq!(1, stmts.len());
+        assert!(matches!(&stmts[0],
+                         Statement::ShowRegion(ShowRegion {
+                             table,
+                             database: Some(database),
+                             ..
+                         }) if table == "test" && database == "public"));
+
+        // SHOW REGION deosn't support like
+        let sql = "SHOW REGION from test like 'disk%'";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let error = result.unwrap_err();
+        assert_eq!(
+            "SQL statement is not supported, keyword: like",
+            error.to_string()
+        );
+
+        let sql = "SHOW REGION from test where Field = 'disk'";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let stmts = result.unwrap();
+        assert_eq!(1, stmts.len());
+        assert!(matches!(&stmts[0],
+                         Statement::ShowRegion(ShowRegion {
                              table,
                              kind: ShowKind::Where(expr),
                              ..

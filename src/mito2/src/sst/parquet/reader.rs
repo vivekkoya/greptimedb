@@ -392,7 +392,10 @@ impl ParquetReaderBuilder {
             .apply(self.file_handle.file_id(), Some(file_size_hint))
             .await
         {
-            Ok(res) => res,
+            Ok(Some(res)) => res,
+            Ok(None) => {
+                return false;
+            }
             Err(err) => {
                 if cfg!(any(test, feature = "test")) {
                     panic!(
@@ -509,7 +512,7 @@ impl ParquetReaderBuilder {
 
                 (row_group_id, rg_begin_row_id..rg_end_row_id)
             })
-            .group_by(|(row_group_id, _)| *row_group_id);
+            .chunk_by(|(row_group_id, _)| *row_group_id);
 
         let ranges_in_row_groups = grouped_in_row_groups
             .into_iter()

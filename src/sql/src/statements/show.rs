@@ -97,6 +97,25 @@ impl Display for ShowIndex {
     }
 }
 
+/// The SQL `SHOW REGION` statement
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
+pub struct ShowRegion {
+    pub kind: ShowKind,
+    pub table: String,
+    pub database: Option<String>,
+}
+
+impl Display for ShowRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SHOW REGION IN {}", &self.table)?;
+        if let Some(database) = &self.database {
+            write!(f, " IN {database}")?;
+        }
+        format_kind!(self, f);
+        Ok(())
+    }
+}
+
 impl ShowDatabases {
     /// Creates a statement for `SHOW DATABASES`
     pub fn new(kind: ShowKind, full: bool) -> Self {
@@ -315,13 +334,7 @@ mod tests {
         assert_eq!("", format!("{}", ShowKind::All));
         assert_eq!(
             "LIKE test",
-            format!(
-                "{}",
-                ShowKind::Like(Ident {
-                    value: "test".to_string(),
-                    quote_style: None,
-                })
-            )
+            format!("{}", ShowKind::Like(Ident::new("test")),)
         );
         assert_eq!(
             "WHERE NOT a",
@@ -329,10 +342,7 @@ mod tests {
                 "{}",
                 ShowKind::Where(Expr::UnaryOp {
                     op: UnaryOperator::Not,
-                    expr: Box::new(Expr::Identifier(Ident {
-                        value: "a".to_string(),
-                        quote_style: None,
-                    })),
+                    expr: Box::new(Expr::Identifier(Ident::new("a"))),
                 })
             )
         );

@@ -30,7 +30,7 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    accept, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    accept, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{internal_err, DataFusionError};
@@ -50,12 +50,13 @@ pub struct DistAnalyzeExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
     properties: PlanProperties,
+    verbose: bool,
     format: AnalyzeFormat,
 }
 
 impl DistAnalyzeExec {
     /// Create a new DistAnalyzeExec
-    pub fn new(input: Arc<dyn ExecutionPlan>, format: AnalyzeFormat) -> Self {
+    pub fn new(input: Arc<dyn ExecutionPlan>, verbose: bool, format: AnalyzeFormat) -> Self {
         let schema = SchemaRef::new(Schema::new(vec![
             Field::new(STAGE, DataType::UInt32, true),
             Field::new(NODE, DataType::UInt32, true),
@@ -66,6 +67,7 @@ impl DistAnalyzeExec {
             input,
             schema,
             properties,
+            verbose,
             format,
         }
     }
@@ -74,8 +76,13 @@ impl DistAnalyzeExec {
     fn compute_properties(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
         let eq_properties = EquivalenceProperties::new(schema);
         let output_partitioning = Partitioning::UnknownPartitioning(1);
-        let exec_mode = input.execution_mode();
-        PlanProperties::new(eq_properties, output_partitioning, exec_mode)
+        let properties = input.properties();
+        PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            properties.emission_type,
+            properties.boundedness,
+        )
     }
 }
 
@@ -116,7 +123,11 @@ impl ExecutionPlan for DistAnalyzeExec {
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(children.pop().unwrap(), self.format)))
+        Ok(Arc::new(Self::new(
+            children.pop().unwrap(),
+            self.verbose,
+            self.format,
+        )))
     }
 
     fn execute(
@@ -138,6 +149,7 @@ impl ExecutionPlan for DistAnalyzeExec {
 
         // Finish the input stream and create the output
         let format = self.format;
+        let verbose = self.verbose;
         let mut input_stream = coalesce_partition_plan.execute(0, context)?;
         let output = async move {
             let mut total_rows = 0;
@@ -145,7 +157,7 @@ impl ExecutionPlan for DistAnalyzeExec {
                 total_rows += batch.num_rows();
             }
 
-            create_output_batch(total_rows, captured_input, captured_schema, format)
+            create_output_batch(total_rows, captured_input, captured_schema, format, verbose)
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -205,11 +217,12 @@ fn create_output_batch(
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
     format: AnalyzeFormat,
+    verbose: bool,
 ) -> DfResult<DfRecordBatch> {
     let mut builder = AnalyzeOutputBuilder::new(schema);
 
     // Treat the current stage as stage 0. Fetch its metrics
-    let mut collector = MetricCollector::default();
+    let mut collector = MetricCollector::new(verbose);
     // Safety: metric collector won't return error
     accept(input.as_ref(), &mut collector).unwrap();
     let stage_0_metrics = collector.record_batch_metrics;

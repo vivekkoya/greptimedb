@@ -38,11 +38,11 @@ use snafu::{OptionExt, ResultExt};
 use sql::statements;
 use store_api::storage::{ScanRequest, TableId};
 
-use super::{InformationTable, COLUMNS};
 use crate::error::{
     CreateRecordBatchSnafu, InternalSnafu, Result, UpgradeWeakCatalogManagerRefSnafu,
 };
 use crate::information_schema::Predicates;
+use crate::system_schema::information_schema::{InformationTable, COLUMNS};
 use crate::CatalogManager;
 
 #[derive(Debug)]
@@ -56,6 +56,8 @@ pub const TABLE_CATALOG: &str = "table_catalog";
 pub const TABLE_SCHEMA: &str = "table_schema";
 pub const TABLE_NAME: &str = "table_name";
 pub const COLUMN_NAME: &str = "column_name";
+pub const REGION_ID: &str = "region_id";
+pub const PEER_ID: &str = "peer_id";
 const ORDINAL_POSITION: &str = "ordinal_position";
 const CHARACTER_MAXIMUM_LENGTH: &str = "character_maximum_length";
 const CHARACTER_OCTET_LENGTH: &str = "character_octet_length";

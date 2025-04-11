@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::{fs, path};
 
@@ -41,6 +42,7 @@ use common_meta::kv_backend::KvBackendRef;
 use common_meta::node_manager::NodeManagerRef;
 use common_meta::peer::Peer;
 use common_meta::region_keeper::MemoryRegionKeeper;
+use common_meta::region_registry::LeaderRegionRegistry;
 use common_meta::sequence::SequenceBuilder;
 use common_meta::wal_options_allocator::{build_wal_options_allocator, WalOptionsAllocatorRef};
 use common_procedure::{ProcedureInfo, ProcedureManagerRef};
@@ -53,7 +55,10 @@ use datanode::config::{DatanodeOptions, ProcedureConfig, RegionEngineConfig, Sto
 use datanode::datanode::{Datanode, DatanodeBuilder};
 use datanode::region_server::RegionServer;
 use file_engine::config::EngineConfig as FileEngineConfig;
-use flow::{FlowConfig, FlowWorkerManager, FlownodeBuilder, FlownodeOptions, FrontendInvoker};
+use flow::{
+    FlowConfig, FlowWorkerManager, FlownodeBuilder, FlownodeInstance, FlownodeOptions,
+    FrontendInvoker,
+};
 use frontend::frontend::{Frontend, FrontendOptions};
 use frontend::instance::builder::FrontendBuilder;
 use frontend::instance::{Instance as FeInstance, StandaloneDatanodeManager};
@@ -72,10 +77,10 @@ use servers::http::HttpOptions;
 use servers::tls::{TlsMode, TlsOption};
 use servers::Mode;
 use snafu::ResultExt;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::RwLock;
 use tracing_appender::non_blocking::WorkerGuard;
 
-use crate::error::Result;
+use crate::error::{Result, StartFlownodeSnafu};
 use crate::options::{GlobalOptions, GreptimeOptions};
 use crate::{error, log_versions, App};
 
@@ -125,7 +130,6 @@ impl SubCommand {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct StandaloneOptions {
-    pub mode: Mode,
     pub enable_telemetry: bool,
     pub default_timezone: Option<String>,
     pub http: HttpOptions,
@@ -155,7 +159,6 @@ pub struct StandaloneOptions {
 impl Default for StandaloneOptions {
     fn default() -> Self {
         Self {
-            mode: Mode::Standalone,
             enable_telemetry: true,
             default_timezone: None,
             http: HttpOptions::default(),
@@ -236,7 +239,6 @@ impl StandaloneOptions {
             grpc: cloned_opts.grpc,
             init_regions_in_background: cloned_opts.init_regions_in_background,
             init_regions_parallelism: cloned_opts.init_regions_parallelism,
-            mode: Mode::Standalone,
             ..Default::default()
         }
     }
@@ -245,13 +247,18 @@ impl StandaloneOptions {
 pub struct Instance {
     datanode: Datanode,
     frontend: Frontend,
-    // TODO(discord9): wrapped it in flownode instance instead
-    flow_worker_manager: Arc<FlowWorkerManager>,
-    flow_shutdown: broadcast::Sender<()>,
+    flownode: FlownodeInstance,
     procedure_manager: ProcedureManagerRef,
     wal_options_allocator: WalOptionsAllocatorRef,
     // Keep the logging guard to prevent the worker from being dropped.
     _guard: Vec<WorkerGuard>,
+}
+
+impl Instance {
+    /// Find the socket addr of a server by its `name`.
+    pub async fn server_addr(&self, name: &str) -> Option<SocketAddr> {
+        self.frontend.server_handlers().addr(name).await
+    }
 }
 
 #[async_trait]
@@ -282,9 +289,7 @@ impl App for Instance {
             .await
             .context(error::StartFrontendSnafu)?;
 
-        self.flow_worker_manager
-            .clone()
-            .run_background(Some(self.flow_shutdown.subscribe()));
+        self.flownode.start().await.context(StartFlownodeSnafu)?;
 
         Ok(())
     }
@@ -305,14 +310,9 @@ impl App for Instance {
             .await
             .context(error::ShutdownDatanodeSnafu)?;
 
-        self.flow_shutdown
-            .send(())
-            .map_err(|_e| {
-                flow::error::InternalSnafu {
-                    reason: "Failed to send shutdown signal to flow worker manager, all receiver end already closed".to_string(),
-                }
-                .build()
-            })
+        self.flownode
+            .shutdown()
+            .await
             .context(error::ShutdownFlownodeSnafu)?;
 
         info!("Datanode instance stopped.");
@@ -373,9 +373,6 @@ impl StartCommand {
         global_options: &GlobalOptions,
         opts: &mut StandaloneOptions,
     ) -> Result<()> {
-        // Should always be standalone mode.
-        opts.mode = Mode::Standalone;
-
         if let Some(dir) = &global_options.log_dir {
             opts.logging.dir.clone_from(dir);
         }
@@ -500,7 +497,7 @@ impl StartCommand {
             .build(),
         );
 
-        let datanode = DatanodeBuilder::new(dn_opts, plugins.clone())
+        let datanode = DatanodeBuilder::new(dn_opts, plugins.clone(), Mode::Standalone)
             .with_kv_backend(kv_backend.clone())
             .with_cache_registry(layered_cache_registry.clone())
             .build()
@@ -533,13 +530,11 @@ impl StartCommand {
             catalog_manager.clone(),
             flow_metadata_manager.clone(),
         );
-        let flownode = Arc::new(
-            flow_builder
-                .build()
-                .await
-                .map_err(BoxedError::new)
-                .context(error::OtherSnafu)?,
-        );
+        let flownode = flow_builder
+            .build()
+            .await
+            .map_err(BoxedError::new)
+            .context(error::OtherSnafu)?;
 
         // set the ref to query for the local flow state
         {
@@ -619,8 +614,6 @@ impl StartCommand {
         .context(error::StartFlownodeSnafu)?;
         flow_worker_manager.set_frontend_invoker(invoker).await;
 
-        let (tx, _rx) = broadcast::channel(1);
-
         let export_metrics_task = ExportMetricsTask::try_new(&opts.export_metrics, Some(&plugins))
             .context(error::ServersSnafu)?;
 
@@ -639,8 +632,7 @@ impl StartCommand {
         Ok(Instance {
             datanode,
             frontend,
-            flow_worker_manager,
-            flow_shutdown: tx,
+            flownode,
             procedure_manager,
             wal_options_allocator,
             _guard: guard,
@@ -662,6 +654,7 @@ impl StartCommand {
                     node_manager,
                     cache_invalidator,
                     memory_region_keeper: Arc::new(MemoryRegionKeeper::default()),
+                    leader_region_registry: Arc::new(LeaderRegionRegistry::default()),
                     table_metadata_manager,
                     table_metadata_allocator,
                     flow_metadata_manager,
@@ -779,6 +772,7 @@ impl InformationExtension for StandaloneInformationExtension {
                     manifest_size: region_stat.manifest_size,
                     sst_size: region_stat.sst_size,
                     index_size: region_stat.index_size,
+                    region_manifest: region_stat.manifest.into(),
                 }
             })
             .collect::<Vec<_>>();
@@ -1055,7 +1049,6 @@ mod tests {
         let options =
             StandaloneOptions::load_layered_options(None, "GREPTIMEDB_STANDALONE").unwrap();
         let default_options = StandaloneOptions::default();
-        assert_eq!(options.mode, default_options.mode);
         assert_eq!(options.enable_telemetry, default_options.enable_telemetry);
         assert_eq!(options.http, default_options.http);
         assert_eq!(options.grpc, default_options.grpc);

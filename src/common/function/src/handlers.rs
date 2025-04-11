@@ -15,8 +15,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use catalog::CatalogManagerRef;
 use common_base::AffectedRows;
-use common_meta::rpc::procedure::{MigrateRegionRequest, ProcedureStateResponse};
+use common_meta::rpc::procedure::{
+    AddRegionFollowerRequest, MigrateRegionRequest, ProcedureStateResponse,
+    RemoveRegionFollowerRequest,
+};
 use common_query::error::Result;
 use common_query::Output;
 use session::context::QueryContextRef;
@@ -63,6 +67,15 @@ pub trait ProcedureServiceHandler: Send + Sync {
 
     /// Query the procedure' state by its id
     async fn query_procedure_state(&self, pid: &str) -> Result<ProcedureStateResponse>;
+
+    /// Add a region follower to a region.
+    async fn add_region_follower(&self, request: AddRegionFollowerRequest) -> Result<()>;
+
+    /// Remove a region follower from a region.
+    async fn remove_region_follower(&self, request: RemoveRegionFollowerRequest) -> Result<()>;
+
+    /// Get the catalog manager
+    fn catalog_manager(&self) -> &CatalogManagerRef;
 }
 
 /// This flow service handler is only use for flush flow for now.
